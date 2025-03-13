@@ -32,7 +32,7 @@
     "require_good_status": true
   },
   "telegram": {
-    "token": "YOUR_TELEGRAM_BOT_TOKEN",  // Замени на токен от BotFather
-    "chat_id": "YOUR_CHAT_ID"            // Замени на твой chat_id (см. ниже)
+    "token": "8092605463:AAHEZ-EcNdnN8YlsFY8XMZSlpO7ZduEp0Yg",  // Замени на токен от BotFather
+    "chat_id": "5038520387"            // Замени на твой chat_id (см. ниже)
   }
 }
