@@ -1,0 +1,38 @@
+{
+  "api_base_url": "https://api.dexscreener.com/latest/dex/tokens/",
+  "token_addresses": [
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+  ],
+  "db_file": "token_analysis.db",
+  "sleep_interval_seconds": 3600,
+  "max_pairs_per_token": 5,
+  "filters": {
+    "min_liquidity_usd": 10000,
+    "min_volume_24h": 5000,
+    "min_pair_age_days": 7
+  },
+  "thresholds": {
+    "rug_price_drop_percent": 90,
+    "rug_liquidity_drop_percent": 90,
+    "pump_price_increase_percent": 1000,
+    "tier1_market_cap": 100000000,
+    "tier1_volume_24h": 1000000,
+    "fake_volume_max_price_change_percent": 5,
+    "fake_volume_min_unique_trades": 10,
+    "bundled_supply_max_holder_percent": 20
+  },
+  "blacklists": {
+    "coins": [],
+    "developers": []
+  },
+  "rugcheck": {
+    "api_endpoint": "https://api.rugcheck.xyz/v1/check",
+    "enabled": true,
+    "min_score": 75,
+    "require_good_status": true
+  },
+  "telegram": {
+    "token": "YOUR_TELEGRAM_BOT_TOKEN",  // Замени на токен от BotFather
+    "chat_id": "YOUR_CHAT_ID"            // Замени на твой chat_id (см. ниже)
+  }
+}

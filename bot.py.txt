@@ -1,0 +1,199 @@
+import requests
+import sqlite3
+import time
+from datetime import datetime
+import json
+import os
+from telegram import Bot
+import asyncio
+
+with open("config.json", "r") as f:
+    CONFIG = json.load(f)
+
+BASE_URL = CONFIG["api_base_url"]
+TOKEN_ADDRESSES = CONFIG["token_addresses"]
+DB_FILE = CONFIG["db_file"]
+SLEEP_INTERVAL = CONFIG["sleep_interval_seconds"]
+MAX_PAIRS = CONFIG["max_pairs_per_token"]
+FILTERS = CONFIG["filters"]
+THRESHOLDS = CONFIG["thresholds"]
+BLACKLIST_COINS = set(CONFIG["blacklists"]["coins"])
+BLACKLIST_DEVS = set(CONFIG["blacklists"]["developers"])
+RUGCHECK = CONFIG["rugcheck"]
+TELEGRAM_TOKEN = CONFIG["telegram"]["token"]
+CHAT_ID = CONFIG["telegram"]["chat_id"]
+
+bot = Bot(TELEGRAM_TOKEN)
+
+def setup_database():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS token_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_address TEXT,
+                    pair_address TEXT,
+                    timestamp TEXT,
+                    price_usd REAL,
+                    volume_24h REAL,
+                    liquidity_usd REAL,
+                    market_cap REAL,
+                    status TEXT,
+                    analysis TEXT,
+                    creator_address TEXT
+                 )''')
+    conn.commit()
+    conn.close()
+
+def fetch_token_data(token_address):
+    url = f"{BASE_URL}{token_address}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("pairs", [])
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data for {token_address}: {e}")
+        return []
+
+def apply_filters(pair):
+    liquidity_usd = float(pair.get("liquidity", {}).get("usd", 0))
+    volume_24h = float(pair.get("volume", {}).get("h24", 0))
+    created_at = pair.get("pairCreatedAt", 0) / 1000
+    pair_age_days = (time.time() - created_at) / (24 * 3600)
+    if liquidity_usd < FILTERS["min_liquidity_usd"]: return False, "Liquidity too low"
+    if volume_24h < FILTERS["min_volume_24h"]: return False, "Volume too low"
+    if pair_age_days < FILTERS["min_pair_age_days"]: return False, "Pair too new"
+    return True, "Passed filters"
+
+def is_blacklisted(token_address, creator_address):
+    if token_address in BLACKLIST_COINS: return True, "Token blacklisted"
+    if creator_address in BLACKLIST_DEVS: return True, "Developer blacklisted"
+    return False, ""
+
+def verify_with_rugcheck(token_address):
+    if not RUGCHECK["enabled"]: return True, "Rugcheck disabled"
+    try:
+        url = f"{RUGCHECK['api_endpoint']}?token={token_address}"
+        response = requests.get(url)
+        response.raise_for_status()
+        result = response.json()
+        score = result.get("score", 0)
+        status = result.get("status", "Unknown")
+        holders = result.get("holders", [])
+        if score < RUGCHECK["min_score"]: return False, f"Rugcheck score too low ({score})"
+        if RUGCHECK["require_good_status"] and status != "Good": return False, f"Rugcheck status not 'Good' ({status})"
+        for holder in holders:
+            if holder.get("percentage", 0) > THRESHOLDS["bundled_supply_max_holder_percent"]:
+                return False, f"Bundled supply detected ({holder['address']} owns {holder['percentage']}%)"
+        return True, "Rugcheck passed"
+    except Exception as e:
+        print(f"Rugcheck API error: {e}")
+        return False, "Rugcheck unavailable"
+
+def detect_fake_volume(pair, previous_data):
+    volume_24h = float(pair.get("volume", {}).get("h24", 0))
+    price_usd = float(pair.get("priceUsd", 0))
+    txns_24h = pair.get("txns", {}).get("h24", {}).get("buys", 0) + pair.get("txns", {}).get("h24", {}).get("sells", 0)
+    if previous_data and previous_data.get("price_usd", 0) > 0:
+        price_change_percent = abs((price_usd - previous_data["price_usd"]) / previous_data["price_usd"]) * 100
+        if volume_24h > FILTERS["min_volume_24h"] * 10 and price_change_percent < THRESHOLDS["fake_volume_max_price_change_percent"]:
+            return True, "High volume with low price movement"
+    if txns_24h < THRESHOLDS["fake_volume_min_unique_trades"] and volume_24h > FILTERS["min_volume_24h"] * 5:
+        return True, "Low unique trades for high volume"
+    return False, "Volume appears legitimate"
+
+def analyze_pair(pair, previous_data=None):
+    price_usd = float(pair.get("priceUsd", 0))
+    volume_24h = float(pair.get("volume", {}).get("h24", 0))
+    liquidity_usd = float(pair.get("liquidity", {}).get("usd", 0))
+    market_cap = price_usd * float(pair.get("fdv", 0)) if pair.get("fdv") else 0
+    status, analysis = "normal", []
+    if previous_data:
+        prev_price = previous_data.get("price_usd", 0)
+        prev_liquidity = previous_data.get("liquidity_usd", 0)
+        if prev_price > 0 and (price_usd / prev_price) < (1 - THRESHOLDS["rug_price_drop_percent"] / 100):
+            status = "rugged"
+            analysis.append(f"Price dropped >{THRESHOLDS['rug_price_drop_percent']}%")
+        if prev_liquidity > 0 and (liquidity_usd / prev_liquidity) < (1 - THRESHOLDS["rug_liquidity_drop_percent"] / 100):
+            status = "rugged"
+            analysis.append(f"Liquidity dropped >{THRESHOLDS['rug_liquidity_drop_percent']}%")
+        if prev_price > 0 and (price_usd / prev_price) > (THRESHOLDS["pump_price_increase_percent"] / 100):
+            status = "pumped"
+            analysis.append(f"Price increased >{THRESHOLDS['pump_price_increase_percent']}%")
+    if market_cap > THRESHOLDS["tier1_market_cap"] and volume_24h > THRESHOLDS["tier1_volume_24h"]:
+        status = "tier-1"
+        analysis.append("High market cap and volume")
+    return {"price_usd": price_usd, "volume_24h": volume_24h, "liquidity_usd": liquidity_usd, "market_cap": market_cap, "status": status, "analysis": "; ".join(analysis)}
+
+def save_to_db(token_address, pair_address, data, creator_address):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''INSERT INTO token_data (token_address, pair_address, timestamp, price_usd, volume_24h, liquidity_usd, market_cap, status, analysis, creator_address)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (token_address, pair_address, datetime.now().isoformat(), data["price_usd"], data["volume_24h"],
+               data["liquidity_usd"], data["market_cap"], data["status"], data["analysis"], creator_address))
+    conn.commit()
+    conn.close()
+
+def load_previous_data(pair_address):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT price_usd, liquidity_usd FROM token_data WHERE pair_address = ? ORDER BY timestamp DESC LIMIT 1", (pair_address,))
+    row = c.fetchone()
+    conn.close()
+    return {"price_usd": row[0], "liquidity_usd": row[1]} if row else None
+
+async def send_telegram_message(message):
+    await bot.send_message(chat_id=CHAT_ID, text=message)
+
+async def run_bot():
+    setup_database()
+    while True:
+        for token_address in TOKEN_ADDRESSES:
+            if token_address in BLACKLIST_COINS:
+                print(f"Skipping blacklisted token: {token_address}")
+                await send_telegram_message(f"Токен {token_address} пропущен: в чёрном списке")
+                continue
+            print(f"Analyzing token: {token_address}")
+            pairs = fetch_token_data(token_address)
+            for pair in pairs[:MAX_PAIRS]:
+                pair_address = pair.get("pairAddress")
+                creator_address = pair.get("creatorAddress", "unknown")
+                blacklisted, blacklist_reason = is_blacklisted(token_address, creator_address)
+                if blacklisted:
+                    print(f"Skipping pair {pair_address}: {blacklist_reason}")
+                    await send_telegram_message(f"Пара {pair_address} пропущена: {blacklist_reason}")
+                    continue
+                passed_filters, filter_reason = apply_filters(pair)
+                if not passed_filters:
+                    print(f"Pair {pair_address} filtered out: {filter_reason}")
+                    await send_telegram_message(f"Пара {pair_address} отфильтрована: {filter_reason}")
+                    continue
+                rugcheck_passed, rugcheck_reason = verify_with_rugcheck(token_address)
+                if not rugcheck_passed:
+                    BLACKLIST_COINS.add(token_address)
+                    if "Bundled supply" in rugcheck_reason and creator_address != "unknown":
+                        BLACKLIST_DEVS.add(creator_address)
+                        await send_telegram_message(f"Разработчик {creator_address} добавлен в чёрный список: связанный запас")
+                    print(f"Pair {pair_address} failed Rugcheck: {rugcheck_reason}")
+                    await send_telegram_message(f"Пара {pair_address} не прошла Rugcheck: {rugcheck_reason}")
+                    continue
+                fake_volume_detected, fake_reason = detect_fake_volume(pair, load_previous_data(pair_address))
+                if fake_volume_detected:
+                    BLACKLIST_COINS.add(token_address)
+                    print(f"Pair {pair_address} flagged for fake volume: {fake_reason}")
+                    await send_telegram_message(f"Пара {pair_address} помечена за фейковый объём: {fake_reason}")
+                    continue
+                previous_data = load_previous_data(pair_address)
+                analysis = analyze_pair(pair, previous_data)
+                save_to_db(token_address, pair_address, analysis, creator_address)
+                message = f"Пара: {pair_address}\nСтатус: {analysis['status']}\nАнализ: {analysis['analysis']}"
+                print(message)
+                await send_telegram_message(message)
+        print(f"Cycle complete. Sleeping for {SLEEP_INTERVAL // 3600} hour(s)...")
+        await send_telegram_message(f"Цикл завершён. Ожидание {SLEEP_INTERVAL // 3600} час(ов)...")
+        await asyncio.sleep(SLEEP_INTERVAL)
+
+if __name__ == "__main__":
+    print("Starting Dexscreener Analysis Bot...")
+    asyncio.run(run_bot())
